@@ -1124,10 +1124,21 @@ computePaymentComponents(
     };
 }
 
-/*
- * Compute the payment components for an overpayment scenario. This includes
- * computing the fee on the overpayment, and splitting the interest and
- * management fee parts.
+/* Computes payment components for an overpayment scenario.
+ *
+ * An overpayment occurs when a borrower pays more than the scheduled periodic
+ * payment amount. The overpayment is treated as extra principal reduction,
+ * but incurs a fee and potentially a penalty interest charge.
+ *
+ * The calculation:
+ * 1. Apply the overpayment fee (reduces the effective payment amount)
+ * 2. Calculate penalty interest on the remaining amount
+ * 3. Split the penalty interest into net interest and management fee
+ * 4. Apply the remainder to principal reduction
+ *
+ * Unlike regular payments which follow the amortization schedule, overpayments
+ * go primarily toward principal, making them more effective at reducing the
+ * loan balance and future interest costs.
  *
  * Equations (20), (21) and (22) from XLS-66 spec, Section A-2 Equation Glossary
  */
@@ -1145,19 +1156,25 @@ computeOverpaymentComponents(
         "ripple::detail::computeOverpaymentComponents : valid overpayment "
         "amount");
 
+    // First, deduct the fixed overpayment fee from the total amount.
+    // This reduces the effective payment that will be applied to the loan.
     // Equation (22) from XLS-66 spec, Section A-2 Equation Glossary
     Number const fee = roundToAsset(
         asset, tenthBipsOfValue(overpayment, overpaymentFeeRate), loanScale);
 
     Number const payment = overpayment - fee;
 
-    // Equation (20) and (21) from XLS-66 spec, Section A-2 Equation
-    // Glossary
+    // Calculate the penalty interest on the effective payment amount.
+    // This interest doesn't follow the normal amortization schedule - it's
+    // a one-time charge for paying early.
+    // Equation (20) and (21) from XLS-66 spec, Section A-2 Equation Glossary
     auto const [rawOverpaymentInterest, rawOverpaymentManagementFee] = [&]() {
         Number const interest =
             tenthBipsOfValue(payment, overpaymentInterestRate);
         return detail::computeInterestAndFeeParts(interest, managementFeeRate);
     }();
+
+    // Round the penalty interest components to the loan scale
     auto const [roundedOverpaymentInterest, roundedOverpaymentManagementFee] =
         [&]() {
             Number const interest =
@@ -1166,15 +1183,33 @@ computeOverpaymentComponents(
                 asset, interest, managementFeeRate, loanScale);
         }();
 
+    // Build the payment components, after fees and penalty
+    // interest are deducted, the remainder goes entirely to principal
+    // reduction.
     return detail::ExtendedPaymentComponents{
         detail::PaymentComponents{
+            // Total tracked value change equals the effective payment amount
             .trackedValueDelta = payment,
+
+            // Remainder goes to principal reduction
             .trackedPrincipalDelta = payment - roundedOverpaymentInterest -
                 roundedOverpaymentManagementFee,
+
+            // Management fee on the penalty interest
             .trackedManagementFeeDelta = roundedOverpaymentManagementFee,
-            .specialCase = detail::PaymentSpecialCase::extra},
+
+            // Mark as extra payment so doPayment() doesn't advance the schedule
+            .specialCase = detail::PaymentSpecialCase::extra,
+        },
+
+        // Untracked management fee is the fixed overpayment fee
         fee,
-        roundedOverpaymentInterest};
+
+        // Untracked interest is the penalty interest charged for overpaying.
+        // This is positive, representing a one-time cost, but it's typically
+        // much smaller than the interest savings from reducing principal.
+        roundedOverpaymentInterest,
+    };
 }
 
 }  // namespace detail
